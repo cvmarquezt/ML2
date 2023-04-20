@@ -1,0 +1,164 @@
+---
+title: "ML2"
+author: "Yo"
+date: "2023-04-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Data exploration
+
+```{r cars}
+rm(list = ls())
+setwd("C:/Users/c_mar/Downloads/competitive-data-science-predict-future-sales")
+
+library(tidyverse)
+library(tree)
+library(dplyr)
+library(caret)
+
+data_raw <- read.csv('sales_train.csv')
+category <- read.csv('items.csv')
+
+(head(data_raw)) 
+data_raw$shop_id<-as.factor(data_raw$shop_id)
+data_raw$item_id<-as.factor(data_raw$item_id) 
+data_raw$month<-as.factor(substr(data_raw$date,4,5))## data is with daily observations. We need month
+data_raw$year<-as.factor(substr(data_raw$date,9,10))## new column "year"
+data_raw<-merge(data_raw,category[,c(2,3)], by=c('item_id'),all=TRUE)
+data_raw$item_category_id<-as.factor(data_raw$item_category_id)
+
+(summary(data_raw))
+```
+
+Transformation to monthly sales, by: item, shop, month, year. Keeping only relevant columns
+
+```{r cars}
+
+data_raw <- data_raw %>% 
+  group_by(shop_id,item_id,month,year) %>% ## these groups are the conditions for the sum of items by month
+  mutate(soldunits=sum(item_cnt_day),avgprice=mean(item_price)) %>% 
+  group_by(item_category_id) %>%
+  mutate(categoryprice=median(avgprice)) 
+
+
+
+data_raw <- data_raw[,-c(2,3,5,6)] ## also we are getting rid of columns we dont need
+summary(data_raw)
+
+```
+
+We are not going to do time series analysis because we only have 36 months Remove extreme values
+
+```{r pressure, echo=FALSE}
+data_unique <- data_raw
+data_unique<-na.omit(data_unique) #we have NA in shop_id because there are items with a shop_id in the category dataset that are not included data_daw
+set.seed(2)
+
+data_unique<-distinct(data_unique)
+(summary(data_unique))
+
+data_unique$soldunits<- ifelse(data_unique$soldunits<0,0,data_unique$soldunits)
+data_unique$avgprice<- ifelse(data_unique$avgprice<0,0,data_unique$avgprice)
+data_unique$categoryprice<- ifelse(data_unique$categoryprice<0,0,data_unique$categoryprice)
+
+plot(avgprice~item_category_id,data = data_unique)
+plot(soldunits~item_category_id,data = data_unique)
+data_unique$avgprice<- ifelse(data_unique$avgprice>50000,data_unique$categoryprice,data_unique$avgprice)
+
+
+```
+
+Regularization: If we did not have information of the previous sales of one item, we should use other type of model with current variables. We don't need to keep all the variables, only the most representatives.
+
+```{r pressure, echo=FALSE}
+set.seed(2)
+train=sample(1:nrow(data_unique), nrow(data_unique)*0.8)
+library(glmnet)
+grid <- 10^seq(10,-8,length=20) #use lasso
+x=model.matrix(soldunits~avgprice+shop_id+month+item_category_id,data_unique)[,-1]
+y = data_unique$soldunits
+model <- cv.glmnet(x[train,],y[train], alpha=0,lambda=grid)
+(coef(model)) ## there are a few significant in item_category_id 
+
+```
+
+```{r pressure, echo=FALSE}
+Min_Lambda <- model$lambda.min
+pred_m1 <- predict(model, s = Min_Lambda, newx = x[-train,])
+RMSE_m1<-sqrt(mean((data_unique$soldunits[-train]-pred_m1[-train])^2))
+
+(RMSE_m1) #20.27
+(cor(pred_m1,data_unique$soldunits[-train])) #.38
+
+```
+
+Boosting
+
+Boosting models can automatically detect and capture complex nonlinear relationships, by combining many simple models (weak learners) to create a more powerful ensemble model. They can handle a wider range of input data types, including continuous, categorical, and binary data. Easy to interpret as this information has to be communicated to store managers (diverse background, marketing)
+
+```{r pressure, echo=FALSE}
+
+library(gbm)
+set.seed(2)
+train=sample(1:nrow(data_unique), nrow(data_unique)*0.8)
+tree=gbm(soldunits~avgprice+shop_id+month+item_category_id,data=data_unique[train,],distribution="gaussian",n.trees=100,interaction.depth=4)## we are having high influence of our sales based on  item_price and shop_id(which is store name)
+summary(tree)
+## GBM STANDS FOR GRADIENT BOOSTING MACHINE WHICH IS AN ENSEMBEL METHOD WHICH TAKES A BUNCH OF TREES AND ITERATIVELY TRAINS THEM ON THE RESIDUALS OF THE PREVIOUS TREE
+yhat=predict(tree,newdata=data_unique[-train,],n.trees=100) ##picking a reasonable amount of trees cause otherwise r will run very long cause we have big number of observations
+(sqrt(mean((yhat-data_unique$soldunits[-train])^2)))  ##our rmse is 8.29.
+(cor(yhat,data_unique$soldunits[-train])) ##cor real vs pred:.86
+```
+
+XGBoost
+
+XGBoost can handle complex data with a large number of features and can also handle missing values in the data (offers regularization techniques)
+
+```{r pressure, echo=FALSE}
+
+library(xgboost)
+set.seed(2)
+train=sample(1:nrow(data_unique), nrow(data_unique)*0.8)
+
+x=model.matrix(soldunits~avgprice+shop_id+month+item_category_id+year,data_unique)[,-1]
+y = data_unique$soldunits
+
+dtrain <- xgb.DMatrix(data = x, label = y)
+
+dtrain <- xgb.DMatrix(data = x[train,], label = y[train])
+dtest <- xgb.DMatrix(data = x[-train,], label = y[-train])
+
+
+params <- list(
+  objective = "reg:squarederror",
+  eval_metric = "rmse",
+  max_depth = 6,
+  eta = 0.3,
+  subsample = 0.8,
+  colsample_bytree = 0.8
+)
+
+model_xgb <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 500,
+  watchlist = list(train = dtrain, test = dtest),
+  early_stopping_rounds = 10,
+  verbose = 0
+)
+
+```
+
+```{r pressure, echo=FALSE}
+importance <- xgb.importance(model = model_xgb)
+print(importance)
+
+predictions <- predict(model_xgb, dtest)
+rmse <- sqrt(mean((data_unique$soldunits[-train] - predictions)^2))
+print(paste("RMSE: ", rmse)) #8.49
+(cor(predictions,data_unique$soldunits[-train])) #.856
+
+```
